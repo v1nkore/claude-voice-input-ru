@@ -1,0 +1,10 @@
+# PyInstaller build artifacts
+build/
+dist/
+
+# python
+__pycache__/
+*.pyc
+
+# Claude Code local config
+.claude/
