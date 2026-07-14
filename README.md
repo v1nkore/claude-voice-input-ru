@@ -2,7 +2,7 @@
 
 ## Способ 1 — встроенная диктовка Claude Code (уже настроена)
 
-В `C:\Users\v1nkore\.claude\settings.json` включено:
+В `%USERPROFILE%\.claude\settings.json` включено:
 
 ```json
 {
@@ -24,7 +24,11 @@
 - Распознавание полностью офлайн; при первом запуске скачается модель (~500 МБ)
 - Точность/скорость настраивается в `voice_input.py`: `MODEL_SIZE = "tiny" | "base" | "small" | "medium"`
 
-Зависимости уже установлены: faster-whisper, sounddevice, keyboard, pyperclip, numpy.
+Установка зависимостей (на новой машине, нужен Python 3.10+):
+
+```
+pip install -r requirements.txt
+```
 
 ## Способ 3 — встроенная диктовка Windows
 
