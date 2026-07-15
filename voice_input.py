@@ -193,11 +193,13 @@ else:
 
 # Настройки можно менять через переменные окружения, без правки кода/пересборки exe:
 #   VOICE_MODEL  = tiny / base / small / medium / large-v3-turbo
+#       (по умолчанию large-v3-turbo — лучшее качество для русского;
+#        на слабой машине поставь VOICE_MODEL=small)
 #   VOICE_HOTKEY = горячая клавиша (по умолчанию f9)
 #   VOICE_VOLUME = громкость звуковых сигналов 0.0–1.0 (по умолчанию 0.2)
 #   VOICE_TARGET_WINDOW = подстрока заголовка окна, куда всегда вставлять текст
 #       (по умолчанию «Claude»). Пусто → вставлять в то окно, что активно при остановке.
-MODEL_SIZE = os.environ.get("VOICE_MODEL", "small")
+MODEL_SIZE = os.environ.get("VOICE_MODEL", "large-v3-turbo")
 TARGET_WINDOW = os.environ.get("VOICE_TARGET_WINDOW", "Claude")
 LANGUAGE = os.environ.get("VOICE_LANG", "ru")
 HOTKEY = os.environ.get("VOICE_HOTKEY", "f9")
