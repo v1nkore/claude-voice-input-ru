@@ -36,6 +36,18 @@ if sys.stdout is None or sys.stderr is None:
     if sys.stderr is None:
         sys.stderr = _log
 
+# ---------- Защита от второго экземпляра ----------
+# Если запущены два экземпляра (например, вручную + из автозагрузки), каждый
+# ловит F9 и каждый вставляет текст — получаются дубли. Мьютекс живёт, пока
+# жив процесс, второй экземпляр молча выходит.
+if sys.platform == "win32":
+    import ctypes as _ctypes
+    _kernel32 = _ctypes.windll.kernel32
+    _kernel32.CreateMutexW(None, False, "Local\\VoiceInputRU_SingleInstance")
+    if _kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+        print("VoiceInputRU уже запущен — второй экземпляр не нужен, выхожу.")
+        sys.exit(0)
+
 import numpy as np
 import sounddevice as sd
 import keyboard
@@ -199,11 +211,18 @@ else:
 #   VOICE_VOLUME = громкость звуковых сигналов 0.0–1.0 (по умолчанию 0.2)
 #   VOICE_TARGET_WINDOW = подстрока заголовка окна, куда всегда вставлять текст
 #       (по умолчанию «Claude»). Пусто → вставлять в то окно, что активно при остановке.
+#   VOICE_MUTE_DISCORD = 1/0 — глушить микрофон в Discord на время записи (по умолчанию 1).
+#       Требует: в Discord (Настройки → Голос и видео → Горячие клавиши) перевязать
+#       «Переключить микрофон» с F9 на VOICE_DISCORD_MUTE_KEY — иначе F9 достаётся
+#       только одной программе (RegisterHotKey резервирует клавишу эксклюзивно).
+#   VOICE_DISCORD_MUTE_KEY = клавиша для Discord-мьюта (по умолчанию scroll lock)
 MODEL_SIZE = os.environ.get("VOICE_MODEL", "large-v3-turbo")
 TARGET_WINDOW = os.environ.get("VOICE_TARGET_WINDOW", "Claude")
 LANGUAGE = os.environ.get("VOICE_LANG", "ru")
 HOTKEY = os.environ.get("VOICE_HOTKEY", "f9")
 SOUND_VOLUME = float(os.environ.get("VOICE_VOLUME", "0.2"))
+MUTE_DISCORD = os.environ.get("VOICE_MUTE_DISCORD", "1").strip().lower() not in ("0", "false", "no")
+DISCORD_MUTE_KEY = os.environ.get("VOICE_DISCORD_MUTE_KEY", "f6")
 SAMPLE_RATE = 16000
 
 recording = False
@@ -313,6 +332,38 @@ def transcribe_and_paste(audio: np.ndarray, target_hwnd=None):
     play(SND_DONE)
 
 
+# (vk, scancode) для клавиш-переключателей — им обязателен флаг KEYEVENTF_EXTENDEDKEY,
+# который библиотека keyboard для этих клавиш не выставляет (проверено: без него
+# keybd_event уходит, но физическое состояние переключателя не меняется, и Discord
+# такое нажатие не видит). Поэтому шлём их напрямую через user32, в обход keyboard.
+_TOGGLE_VK = {
+    "scroll lock": (0x91, 0x46),
+    "num lock": (0x90, 0x45),
+    "pause": (0x13, 0x45),
+}
+
+
+def toggle_discord_mute():
+    """Шлёт DISCORD_MUTE_KEY, чтобы Discord (перевязанный на эту клавишу в своих
+    настройках) переключил мьют синхронно со стартом/стопом записи. F9 при этом
+    RegisterHotKey держит эксклюзивно только за собой — Discord его больше не видит,
+    поэтому мьют развязан на отдельную клавишу."""
+    if not MUTE_DISCORD:
+        return
+    key = DISCORD_MUTE_KEY.strip().lower()
+    try:
+        if sys.platform == "win32" and key in _TOGGLE_VK:
+            vk, scan = _TOGGLE_VK[key]
+            KEYEVENTF_EXTENDEDKEY = 0x0001
+            KEYEVENTF_KEYUP = 0x0002
+            _user32.keybd_event(vk, scan, KEYEVENTF_EXTENDEDKEY, 0)
+            _user32.keybd_event(vk, scan, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0)
+        else:
+            keyboard.send(DISCORD_MUTE_KEY)
+    except Exception as e:
+        print(f"Не удалось переключить мьют в Discord: {e}")
+
+
 _last_toggle = 0.0  # антидребезг: повторный триггер не должен дёргать старт/стоп дважды
 _toggle_lock = threading.Lock()
 
@@ -338,10 +389,12 @@ def _toggle_body():
         while not audio_queue.empty():
             audio_queue.get_nowait()
         recording = True
+        toggle_discord_mute()
         play(SND_START)
         print(f"Запись... ({HOTKEY} — остановить)")
     else:
         recording = False
+        toggle_discord_mute()
         # Ищем окно Claude по заголовку и всегда шлём текст туда — независимо от
         # того, где сейчас курсор. Если не нашли (Claude закрыт) — откат на активное окно.
         target_hwnd = find_target_window(TARGET_WINDOW) or get_active_window()
