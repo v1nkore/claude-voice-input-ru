@@ -3,3 +3,7 @@ sounddevice
 keyboard
 pyperclip
 numpy
+
+# для машины с NVIDIA-GPU (ускорение CUDA) — раскомментируй:
+# nvidia-cublas-cu12
+# nvidia-cudnn-cu12

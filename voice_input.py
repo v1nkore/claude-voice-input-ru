@@ -207,6 +207,12 @@ else:
 #   VOICE_MODEL  = tiny / base / small / medium / large-v3-turbo
 #       (по умолчанию large-v3-turbo — лучшее качество для русского;
 #        на слабой машине поставь VOICE_MODEL=small)
+#   VOICE_DEVICE = auto / cuda / cpu (по умолчанию auto: GPU, если есть, иначе CPU).
+#       Для GPU нужны cuBLAS/cuDNN: pip install nvidia-cublas-cu12 nvidia-cudnn-cu12
+#   VOICE_BEAM   = ширина beam search (по умолчанию 1 — greedy, самый быстрый)
+#   VOICE_CHUNK_SEC = длина куска (сек), распознаваемого фоном прямо во время записи;
+#       к остановке почти всё уже распознано, ждать остаётся только хвост.
+#       0 — отключить (распознавать всё целиком после остановки). По умолчанию 12.
 #   VOICE_HOTKEY = горячая клавиша (по умолчанию f9)
 #   VOICE_VOLUME = громкость звуковых сигналов 0.0–1.0 (по умолчанию 0.2)
 #   VOICE_TARGET_WINDOW = подстрока заголовка окна, куда всегда вставлять текст
@@ -226,7 +232,6 @@ DISCORD_MUTE_KEY = os.environ.get("VOICE_DISCORD_MUTE_KEY", "f6")
 SAMPLE_RATE = 16000
 
 recording = False
-frames = []
 audio_queue = queue.Queue()
 
 
@@ -252,9 +257,10 @@ def _make_chime(notes, note_len=0.10, note_gap=0.07, volume=SOUND_VOLUME):
         buf = buf / peak * volume
     return buf
 
-# До-мажорные интервалы — привычные «уведомительные» звуки
-SND_START = _make_chime([523.25, 783.99])          # C5 -> G5, вверх: запись пошла
-SND_STOP = _make_chime([783.99, 523.25])           # G5 -> C5, вниз: записал, думаю
+# Старт и стоп сделаны контрастными (регистр + длина + число нот),
+# зеркальные мелодии из одних нот на слух не различались.
+SND_START = _make_chime([1046.5], note_len=0.07)             # C6: один короткий высокий «динь»
+SND_STOP = _make_chime([392.0, 261.63], note_len=0.16)       # G4 -> C4: два долгих низких
 SND_DONE = _make_chime([659.25, 1046.5], 0.09)     # E5 -> C6: текст вставлен
 SND_EMPTY = _make_chime([311.13, 233.08], 0.12)    # мягкий низкий: ничего не распознано
 
@@ -269,17 +275,54 @@ def play(sound):
 # ---------- Запись и распознавание ----------
 
 print(f"Загрузка модели Whisper '{MODEL_SIZE}' (при первом запуске скачивается)...")
+
+def _add_nvidia_dll_dirs():
+    """cuBLAS/cuDNN, поставленные через pip (nvidia-cublas-cu12, nvidia-cudnn-cu12),
+    лежат в site-packages/nvidia/*/bin — ctranslate2 ищет их через PATH."""
+    try:
+        import nvidia  # noqa: F401 — пакет-неймспейс, есть только если стоят cu12-колёса
+    except ImportError:
+        return
+    import nvidia as _nv
+    for root in _nv.__path__:
+        for sub in os.listdir(root):
+            bin_dir = os.path.join(root, sub, "bin")
+            if os.path.isdir(bin_dir):
+                os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
+                try:
+                    os.add_dll_directory(bin_dir)
+                except (AttributeError, OSError):
+                    pass
+
 from faster_whisper import WhisperModel
 # cpu_threads=0 → ctranslate2 сам берёт число физических ядер; задаём явно все ядра
 # для ускорения тяжёлой large-v3-turbo на CPU.
 _cpu_threads = int(os.environ.get("VOICE_CPU_THREADS", str(os.cpu_count() or 0)))
-model = WhisperModel(
-    MODEL_SIZE, device="cpu", compute_type="int8", cpu_threads=_cpu_threads
-)
+
+def _load_model():
+    """GPU (float16), если есть CUDA; иначе CPU (int8). VOICE_DEVICE=cpu — принудительно CPU.
+    Ошибка всплывает только на первом прогоне, поэтому пробный transcribe обязателен —
+    заодно прогревает модель, и первая реальная фраза не ждёт инициализации."""
+    want = os.environ.get("VOICE_DEVICE", "auto").strip().lower()
+    if want != "cpu":
+        try:
+            _add_nvidia_dll_dirs()
+            m = WhisperModel(MODEL_SIZE, device="cuda", compute_type="float16")
+            list(m.transcribe(np.zeros(SAMPLE_RATE // 2, dtype=np.float32), language=LANGUAGE)[0])
+            return m, "cuda"
+        except Exception as e:
+            if want == "cuda":
+                raise
+            print(f"CUDA недоступна ({type(e).__name__}), работаю на CPU.")
+    m = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8", cpu_threads=_cpu_threads)
+    list(m.transcribe(np.zeros(SAMPLE_RATE // 2, dtype=np.float32), language=LANGUAGE)[0])
+    return m, "cpu"
+
+model, _device = _load_model()
 # распознавание — по одному прогону за раз: две тяжёлые транскрипции внахлёст
 # конкурируют за CPU и тормозят обе
 transcribe_lock = threading.Lock()
-print(f"Модель загружена (cpu_threads={_cpu_threads}).")
+print(f"Модель загружена ({'GPU' if _device == 'cuda' else f'CPU, потоков={_cpu_threads}'}).")
 print(f"Нажмите {HOTKEY.upper()} — начать запись, {HOTKEY.upper()} ещё раз — распознать и вставить.")
 print("Если текст не вставился сам — он уже в буфере обмена, нажмите Ctrl+V.")
 print("Выход: Ctrl+C в этом окне.")
@@ -312,24 +355,129 @@ def paste_text(text, target_hwnd=None):
     keyboard.send("ctrl+v")
 
 
-def transcribe_and_paste(audio: np.ndarray, target_hwnd=None):
-    if len(audio) < SAMPLE_RATE // 2:  # меньше полсекунды — игнорируем
-        print("Слишком короткая запись, пропускаю.")
-        play(SND_EMPTY)
-        return
-    print("Распознаю...")
-    with transcribe_lock:  # не даём двум прогонам конкурировать за CPU
+# Типовые галлюцинации Whisper на хвостовой тишине (обучен на субтитрах —
+# на паузе «дописывает» их служебные фразы). Сравнение без пунктуации/регистра.
+_HALLUCINATIONS = {
+    "спасибо", "спасибо за просмотр", "спасибо за внимание", "благодарю за внимание",
+    "продолжение следует", "до встречи", "до новых встреч", "пока",
+    "субтитры сделал dimatorzok", "субтитры делал dimatorzok", "субтитры создавал dimatorzok",
+    "редактор субтитров ас корректор ав", "titry",
+}
+_NORM_RE = None  # компилируется при первом вызове, чтобы не тащить re наверх
+
+
+def _is_hallucination(seg) -> bool:
+    """Отсекает сегмент-галлюцинацию: типовая фраза из чёрного списка либо
+    сегмент, в котором модель сама почти уверена, что речи не было."""
+    global _NORM_RE
+    if _NORM_RE is None:
+        import re
+        _NORM_RE = re.compile(r"[^\wа-яё ]+", re.IGNORECASE)
+    norm = _NORM_RE.sub("", seg.text.lower()).strip()
+    if norm in _HALLUCINATIONS:
+        return True
+    return seg.no_speech_prob > 0.6 and seg.avg_logprob < -0.8
+
+
+def _transcribe_text(audio: np.ndarray) -> str:
+    """Распознаёт кусок аудио, отбрасывая сегменты-галлюцинации. Возвращает текст ('' — пусто)."""
+    with transcribe_lock:  # не даём двум прогонам конкурировать за CPU/GPU
         segments, _ = model.transcribe(
-            audio, language=LANGUAGE, vad_filter=True, beam_size=5
+            audio,
+            language=LANGUAGE,
+            vad_filter=True,
+            # VAD режет тишину до/после речи — именно на ней рождаются «спасибо за просмотр»
+            vad_parameters={"min_silence_duration_ms": 500, "speech_pad_ms": 250},
+            # greedy вместо beam=5: для диктовки разницы нет, скорость выше
+            beam_size=int(os.environ.get("VOICE_BEAM", "1")),
+            # не подмешивать уже распознанный текст в контекст — источник зацикливаний
+            condition_on_previous_text=False,
         )
-        text = " ".join(seg.text.strip() for seg in segments).strip()
-    if not text:
-        print("Речь не распознана.")
-        play(SND_EMPTY)
-        return
-    print(f"Распознано: {text}")
-    paste_text(text, target_hwnd)
-    play(SND_DONE)
+        parts = []
+        for seg in segments:
+            if _is_hallucination(seg):
+                print(f"  (отброшен сегмент-галлюцинация: {seg.text.strip()!r})")
+                continue
+            parts.append(seg.text.strip())
+    return " ".join(parts).strip()
+
+
+# ---------- Чанковая транскрипция: распознаём фоном прямо во время записи ----------
+# Энкодер Whisper — узкое место на CPU (~0.7 c на 1 c аудио для large-v3-turbo).
+# Поэтому длинный монолог режем на куски по паузам и распознаём их, пока запись idет:
+# к остановке готов почти весь текст, ждать остаётся только хвост.
+
+CHUNK_SEC = float(os.environ.get("VOICE_CHUNK_SEC", "12"))
+_MIN_CHUNK_SEC = 4.0  # раньше этой границы паузу не ищем — куски короче бьют по качеству
+
+
+class _RecordingSession:
+    """Одна запись: копит аудио из audio_queue, фоном распознаёт готовые куски."""
+
+    def __init__(self):
+        self.parts: list[str] = []
+        self.buf = np.zeros(0, dtype=np.float32)
+        self.total_samples = 0
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _split_point(self) -> int:
+        """Индекс разреза первых CHUNK_SEC секунд буфера: последняя пауза
+        (тихие 250 мс), чтобы не резать слово посередине. Нет паузы — режем как есть."""
+        end = int(CHUNK_SEC * SAMPLE_RATE)
+        start = int(_MIN_CHUNK_SEC * SAMPLE_RATE)
+        seg = np.abs(self.buf[:end])
+        win = int(0.25 * SAMPLE_RATE)
+        # скользящее среднее |x| окном 250 мс через кумулятивную сумму — O(n)
+        c = np.cumsum(seg, dtype=np.float64)
+        rolling = (c[win:] - c[:-win]) / win
+        thr = max(1e-4, 0.15 * float(seg.mean()))
+        quiet = np.where(rolling[start:] < thr)[0]
+        if len(quiet):
+            return start + int(quiet[-1]) + win // 2
+        return end
+
+    def _append_queue_item(self, data) -> None:
+        piece = data.flatten().astype(np.float32)
+        self.buf = np.concatenate([self.buf, piece])
+        self.total_samples += len(piece)
+
+    def _run(self):
+        while True:
+            try:
+                self._append_queue_item(audio_queue.get(timeout=0.2))
+            except queue.Empty:
+                if not recording:
+                    break  # запись остановлена и очередь пуста — дальше ничего не придёт
+                continue
+            if CHUNK_SEC > 0 and recording and len(self.buf) >= CHUNK_SEC * SAMPLE_RATE:
+                cut = self._split_point()
+                chunk, self.buf = self.buf[:cut], self.buf[cut:]
+                text = _transcribe_text(chunk)
+                if text:
+                    self.parts.append(text)
+                    print(f"  (фоном распознано: …{text[-60:]})")
+        if len(self.buf):
+            text = _transcribe_text(self.buf)
+            if text:
+                self.parts.append(text)
+
+    def finish_and_paste(self, target_hwnd=None):
+        """Вызывается после остановки записи: дожидается хвоста и вставляет текст."""
+        t0 = time.monotonic()
+        self.thread.join()
+        if self.total_samples < SAMPLE_RATE // 2:  # меньше полсекунды — игнорируем
+            print("Слишком короткая запись, пропускаю.")
+            play(SND_EMPTY)
+            return
+        text = " ".join(self.parts).strip()
+        if not text:
+            print("Речь не распознана.")
+            play(SND_EMPTY)
+            return
+        print(f"Распознано (ожидание {time.monotonic() - t0:.1f} с): {text}")
+        paste_text(text, target_hwnd)
+        play(SND_DONE)
 
 
 # (vk, scancode) для клавиш-переключателей — им обязателен флаг KEYEVENTF_EXTENDEDKEY,
@@ -369,7 +517,7 @@ _toggle_lock = threading.Lock()
 
 
 def toggle():
-    global recording, frames, _last_toggle
+    global recording, _last_toggle
     if not _toggle_lock.acquire(blocking=False):
         return  # предыдущий toggle ещё выполняется — пропускаем
     try:
@@ -382,13 +530,16 @@ def toggle():
         _toggle_lock.release()
 
 
+_session = None  # текущая _RecordingSession
+
+
 def _toggle_body():
-    global recording, frames
+    global recording, _session
     if not recording:
-        frames = []
         while not audio_queue.empty():
             audio_queue.get_nowait()
         recording = True
+        _session = _RecordingSession()
         toggle_discord_mute()
         play(SND_START)
         print(f"Запись... ({HOTKEY} — остановить)")
@@ -401,17 +552,11 @@ def _toggle_body():
         title = _window_title(target_hwnd)
         print(f"Целевое окно: {title or '<без заголовка>'} (hwnd={target_hwnd})")
         play(SND_STOP)
-        chunks = []
-        while not audio_queue.empty():
-            chunks.append(audio_queue.get_nowait())
-        if chunks:
-            audio = np.concatenate(chunks).flatten().astype(np.float32)
-            threading.Thread(
-                target=transcribe_and_paste, args=(audio, target_hwnd), daemon=True
-            ).start()
-        else:
-            print("Пустая запись.")
-            play(SND_EMPTY)
+        print("Распознаю...")
+        sess, _session = _session, None
+        threading.Thread(
+            target=sess.finish_and_paste, args=(target_hwnd,), daemon=True
+        ).start()
 
 
 def _parse_hotkey(spec):
