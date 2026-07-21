@@ -44,7 +44,9 @@ exe = EXE(
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=True,
+    # windowed: без окна консоли в панели задач; вывод идёт в voice_input.log
+    # рядом с exe (см. перенаправление stdout/stderr в начале voice_input.py)
+    console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
