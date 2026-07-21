@@ -11,3 +11,5 @@ __pycache__/
 
 # runtime log
 *.log
+build_new/
+dist_new/
